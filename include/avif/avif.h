@@ -1163,6 +1163,14 @@ AVIF_API avifResult avifEncoderAddImageGrid(avifEncoder * encoder,
                                             uint32_t gridRows,
                                             const avifImage * const * cellImages,
                                             avifAddImageFlags addImageFlags);
+AVIF_API avifResult avifEncoderAddFaceImageGrid(avifEncoder * encoder,
+                                            uint32_t gridCols,
+                                            uint32_t gridRows,
+                                            const int * faceIdCells,
+                                            const int sizeFaceIdCells,
+                                            const avifImage * const * cellImages,
+                                            avifAddImageFlags addImageFlags);
+                                            
 AVIF_API avifResult avifEncoderFinish(avifEncoder * encoder, avifRWData * output);
 
 // Codec-specific, optional "advanced" tuning settings, in the form of string key/value pairs,

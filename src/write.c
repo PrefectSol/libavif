@@ -7,6 +7,24 @@
 #include <string.h>
 #include <time.h>
 
+// Modification.
+//-----------------------------------------------------------------
+
+int contains(const int *array, const int size, const int number)
+{
+    for(int i = 0; i < size; i++)
+    {
+        if (array[i] == number)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+//-----------------------------------------------------------------
+
 #define MAX_ASSOCIATIONS 16
 struct ipmaArray
 {
@@ -1205,6 +1223,383 @@ avifResult avifEncoderAddImageGrid(avifEncoder * encoder,
     }
     return avifEncoderAddImageInternal(encoder, gridCols, gridRows, cellImages, 1, addImageFlags | AVIF_ADD_IMAGE_FLAG_SINGLE); // image grids cannot be image sequences
 }
+
+// Modification.
+// -----------------------------------------------------------------
+
+avifResult avifEncoderAddFaceImageGrid(avifEncoder * encoder,
+                                            uint32_t gridCols,
+                                            uint32_t gridRows,
+                                            const int * faceIdCells,
+                                            const int sizeFaceIdCells,
+                                            const avifImage * const * cellImages,
+                                            avifAddImageFlags addImageFlags) 
+{
+    avifDiagnosticsClearError(&encoder->diag);
+    if ((gridCols == 0) || (gridCols > 256) || (gridRows == 0) || (gridRows > 256)) {
+        return AVIF_RESULT_INVALID_IMAGE_GRID;
+    }
+    return avifEncoderAddFaceImageInternal(encoder, gridCols, gridRows, faceIdCells, sizeFaceIdCells, cellImages, 1, addImageFlags | AVIF_ADD_IMAGE_FLAG_SINGLE); // image grids cannot be image sequences
+
+}
+
+static avifResult avifEncoderAddFaceImageInternal(avifEncoder * encoder,
+                                              uint32_t gridCols,
+                                              uint32_t gridRows,
+                                              const int * faceIdCells,
+                                              const int sizeFaceIdCells,
+                                              const avifImage * const * cellImages,
+                                              uint64_t durationInTimescales,
+                                              avifAddImageFlags addImageFlags)
+{
+    // -----------------------------------------------------------------------
+    // Verify encoding is possible
+
+    if (!avifCodecName(encoder->codecChoice, AVIF_CODEC_FLAG_CAN_ENCODE)) {
+        return AVIF_RESULT_NO_CODEC_AVAILABLE;
+    }
+
+    // -----------------------------------------------------------------------
+    // Validate images
+
+    const uint32_t cellCount = gridCols * gridRows;
+    if (cellCount == 0) {
+        return AVIF_RESULT_INVALID_ARGUMENT;
+    }
+
+    const avifImage * firstCell = cellImages[0];
+    const avifImage * bottomRightCell = cellImages[cellCount - 1];
+    if ((firstCell->depth != 8) && (firstCell->depth != 10) && (firstCell->depth != 12)) {
+        return AVIF_RESULT_UNSUPPORTED_DEPTH;
+    }
+    if (!firstCell->width || !firstCell->height || !bottomRightCell->width || !bottomRightCell->height) {
+        return AVIF_RESULT_NO_CONTENT;
+    }
+
+    // HEIF (ISO 23008-12:2017), Section 6.6.2.3.1:
+    //   All input images shall have exactly the same width and height; call those tile_width and tile_height.
+    // HEIF (ISO 23008-12:2017), Section 6.6.2.3.1:
+    //   The reconstructed image is formed by tiling the input images into a grid with a column width
+    //   (potentially excluding the right-most column) equal to tile_width and a row height (potentially
+    //   excluding the bottom-most row) equal to tile_height, without gap or overlap, and then
+    //   trimming on the right and the bottom to the indicated output_width and output_height.
+    // Consider the combined input cellImages as the user's final output intent.
+    // Right and bottom cells may be padded below so that all tiles are tileWidth by tileHeight,
+    // and the output cropped to gridWidth by gridHeight.
+    const uint32_t tileWidth = firstCell->width;
+    const uint32_t tileHeight = firstCell->height;
+    const uint32_t gridWidth = (gridCols - 1) * tileWidth + bottomRightCell->width;
+    const uint32_t gridHeight = (gridRows - 1) * tileHeight + bottomRightCell->height;
+    for (uint32_t cellIndex = 0; cellIndex < cellCount; ++cellIndex) {
+        const avifImage * cellImage = cellImages[cellIndex];
+        const uint32_t expectedCellWidth = ((cellIndex + 1) % gridCols) ? tileWidth : bottomRightCell->width;
+        const uint32_t expectedCellHeight = (cellIndex < (cellCount - gridCols)) ? tileHeight : bottomRightCell->height;
+        if ((cellImage->width != expectedCellWidth) || (cellImage->height != expectedCellHeight)) {
+            return AVIF_RESULT_INVALID_IMAGE_GRID;
+        }
+    }
+
+    if ((bottomRightCell->width > tileWidth) || (bottomRightCell->height > tileHeight)) {
+        return AVIF_RESULT_INVALID_IMAGE_GRID;
+    }
+    if ((cellCount > 1) &&
+        !avifAreGridDimensionsValid(firstCell->yuvFormat, gridWidth, gridHeight, tileWidth, tileHeight, &encoder->diag)) {
+        return AVIF_RESULT_INVALID_IMAGE_GRID;
+    }
+
+    for (uint32_t cellIndex = 0; cellIndex < cellCount; ++cellIndex) {
+        const avifImage * cellImage = cellImages[cellIndex];
+        // MIAF (ISO 23000-22:2019), Section 7.3.11.4.1:
+        //   All input images of a grid image item shall use the same coding format, chroma sampling format, and the
+        //   same decoder configuration (see 7.3.6.2).
+        if ((cellImage->depth != firstCell->depth) || (cellImage->yuvFormat != firstCell->yuvFormat) ||
+            (cellImage->yuvRange != firstCell->yuvRange) || (cellImage->colorPrimaries != firstCell->colorPrimaries) ||
+            (cellImage->transferCharacteristics != firstCell->transferCharacteristics) ||
+            (cellImage->matrixCoefficients != firstCell->matrixCoefficients) || (!!cellImage->alphaPlane != !!firstCell->alphaPlane) ||
+            (cellImage->alphaPremultiplied != firstCell->alphaPremultiplied)) {
+            return AVIF_RESULT_INVALID_IMAGE_GRID;
+        }
+
+        if (!cellImage->yuvPlanes[AVIF_CHAN_Y]) {
+            return AVIF_RESULT_NO_CONTENT;
+        }
+
+        if (cellImage->yuvFormat == AVIF_PIXEL_FORMAT_NONE) {
+            return AVIF_RESULT_NO_YUV_FORMAT_SELECTED;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Validate flags
+
+    if (encoder->data->singleImage) {
+        // The previous call to avifEncoderAddImage() set AVIF_ADD_IMAGE_FLAG_SINGLE.
+        // avifEncoderAddImage() cannot be called again for this encode.
+        return AVIF_RESULT_ENCODE_COLOR_FAILED;
+    }
+
+    if (addImageFlags & AVIF_ADD_IMAGE_FLAG_SINGLE) {
+        encoder->data->singleImage = AVIF_TRUE;
+
+        if (encoder->data->items.count > 0) {
+            // AVIF_ADD_IMAGE_FLAG_SINGLE may only be set on the first and only image.
+            return AVIF_RESULT_INVALID_ARGUMENT;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Map quality and qualityAlpha to quantizer and quantizerAlpha
+    encoder->data->quantizer = avifQualityToQuantizer(encoder->quality, encoder->minQuantizer, encoder->maxQuantizer);
+    encoder->data->quantizerAlpha = avifQualityToQuantizer(encoder->qualityAlpha, encoder->minQuantizerAlpha, encoder->maxQuantizerAlpha);
+
+    // -----------------------------------------------------------------------
+    // Handle automatic tiling
+
+    encoder->data->tileRowsLog2 = AVIF_CLAMP(encoder->tileRowsLog2, 0, 6);
+    encoder->data->tileColsLog2 = AVIF_CLAMP(encoder->tileColsLog2, 0, 6);
+    if (encoder->autoTiling) {
+        // Use as many tiles as allowed by the minimum tile area requirement and impose a maximum
+        // of 8 tiles.
+        const int threads = 8;
+        avifSetTileConfiguration(threads, tileWidth, tileHeight, &encoder->data->tileRowsLog2, &encoder->data->tileColsLog2);
+    }
+
+    // -----------------------------------------------------------------------
+    // All encoder settings are known now. Detect changes.
+
+    avifEncoderChanges encoderChanges;
+    if (!avifEncoderDetectChanges(encoder, &encoderChanges)) {
+        return AVIF_RESULT_CANNOT_CHANGE_SETTING;
+    }
+    avifEncoderBackupSettings(encoder);
+
+    // -----------------------------------------------------------------------
+
+    if (durationInTimescales == 0) {
+        durationInTimescales = 1;
+    }
+
+    if (encoder->data->items.count == 0) {
+        // Make a copy of the first image's metadata (sans pixels) for future writing/validation
+        const avifResult copyResult = avifImageCopy(encoder->data->imageMetadata, firstCell, 0);
+        if (copyResult != AVIF_RESULT_OK) {
+            return copyResult;
+        }
+
+        // Prepare all AV1 items
+
+        uint16_t gridColorID = 0;
+        if (cellCount > 1) {
+            avifEncoderItem * gridColorItem = avifEncoderDataCreateItem(encoder->data, "grid", "Color", 6, 0);
+            avifWriteGridPayload(&gridColorItem->metadataPayload, gridCols, gridRows, gridWidth, gridHeight);
+            gridColorItem->gridCols = gridCols;
+            gridColorItem->gridRows = gridRows;
+            gridColorItem->gridWidth = gridWidth;
+            gridColorItem->gridHeight = gridHeight;
+
+            gridColorID = gridColorItem->id;
+            encoder->data->primaryItemID = gridColorID;
+        }
+
+        for (uint32_t cellIndex = 0; cellIndex < cellCount; ++cellIndex) {
+            avifEncoderItem * item = avifEncoderDataCreateItem(encoder->data, "av01", "Color", 6, cellIndex);
+            item->codec = avifCodecCreate(encoder->codecChoice, AVIF_CODEC_FLAG_CAN_ENCODE);
+            if (!item->codec) {
+                // Just bail out early, we're not surviving this function without an encoder compiled in
+                return AVIF_RESULT_NO_CODEC_AVAILABLE;
+            }
+            item->codec->csOptions = encoder->csOptions;
+            item->codec->diag = &encoder->diag;
+
+            if (cellCount > 1) {
+                item->dimgFromID = gridColorID;
+                item->hiddenImage = AVIF_TRUE;
+            } else {
+                encoder->data->primaryItemID = item->id;
+            }
+        }
+
+        encoder->data->alphaPresent = (firstCell->alphaPlane != NULL);
+        if (encoder->data->alphaPresent && (addImageFlags & AVIF_ADD_IMAGE_FLAG_SINGLE)) {
+            // If encoding a single image in which the alpha plane exists but is entirely opaque,
+            // simply skip writing an alpha AV1 payload entirely, as it'll be interpreted as opaque
+            // and is less bytes.
+            //
+            // However, if encoding an image sequence, the first frame's alpha plane being entirely
+            // opaque could be a false positive for removing the alpha AV1 payload, as it might simply
+            // be a fade out later in the sequence. This is why avifImageIsOpaque() is only called
+            // when encoding a single image.
+
+            encoder->data->alphaPresent = AVIF_FALSE;
+            for (uint32_t cellIndex = 0; cellIndex < cellCount; ++cellIndex) {
+                const avifImage * cellImage = cellImages[cellIndex];
+                if (!avifImageIsOpaque(cellImage)) {
+                    encoder->data->alphaPresent = AVIF_TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (encoder->data->alphaPresent) {
+            uint16_t gridAlphaID = 0;
+            if (cellCount > 1) {
+                avifEncoderItem * gridAlphaItem = avifEncoderDataCreateItem(encoder->data, "grid", "Alpha", 6, 0);
+                avifWriteGridPayload(&gridAlphaItem->metadataPayload, gridCols, gridRows, gridWidth, gridHeight);
+                gridAlphaItem->alpha = AVIF_TRUE;
+                gridAlphaItem->irefToID = encoder->data->primaryItemID;
+                gridAlphaItem->irefType = "auxl";
+                gridAlphaItem->gridCols = gridCols;
+                gridAlphaItem->gridRows = gridRows;
+                gridAlphaItem->gridWidth = gridWidth;
+                gridAlphaItem->gridHeight = gridHeight;
+                gridAlphaID = gridAlphaItem->id;
+
+                if (encoder->data->imageMetadata->alphaPremultiplied) {
+                    avifEncoderItem * primaryItem = avifEncoderDataFindItemByID(encoder->data, encoder->data->primaryItemID);
+                    assert(primaryItem);
+                    primaryItem->irefType = "prem";
+                    primaryItem->irefToID = gridAlphaID;
+                }
+            }
+
+            for (uint32_t cellIndex = 0; cellIndex < cellCount; ++cellIndex) {
+                avifEncoderItem * item = avifEncoderDataCreateItem(encoder->data, "av01", "Alpha", 6, cellIndex);
+                item->codec = avifCodecCreate(encoder->codecChoice, AVIF_CODEC_FLAG_CAN_ENCODE);
+                if (!item->codec) {
+                    return AVIF_RESULT_NO_CODEC_AVAILABLE;
+                }
+                item->codec->csOptions = encoder->csOptions;
+                item->codec->diag = &encoder->diag;
+                item->alpha = AVIF_TRUE;
+
+                if (cellCount > 1) {
+                    item->dimgFromID = gridAlphaID;
+                    item->hiddenImage = AVIF_TRUE;
+                } else {
+                    item->irefToID = encoder->data->primaryItemID;
+                    item->irefType = "auxl";
+
+                    if (encoder->data->imageMetadata->alphaPremultiplied) {
+                        avifEncoderItem * primaryItem = avifEncoderDataFindItemByID(encoder->data, encoder->data->primaryItemID);
+                        assert(primaryItem);
+                        primaryItem->irefType = "prem";
+                        primaryItem->irefToID = item->id;
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Create metadata items (Exif, XMP)
+
+        if (firstCell->exif.size > 0) {
+            const avifResult result = avifEncoderDataCreateExifItem(encoder->data, &firstCell->exif);
+            if (result != AVIF_RESULT_OK) {
+                return result;
+            }
+        }
+
+        if (firstCell->xmp.size > 0) {
+            const avifResult result = avifEncoderDataCreateXMPItem(encoder->data, &firstCell->xmp);
+            if (result != AVIF_RESULT_OK) {
+                return result;
+            }
+        }
+    } else {
+        // Another frame in an image sequence
+
+        const avifImage * imageMetadata = encoder->data->imageMetadata;
+        // If the first image in the sequence had an alpha plane (even if fully opaque), all
+        // subsequent images must have alpha as well.
+        if ((imageMetadata->depth != firstCell->depth) || (imageMetadata->yuvFormat != firstCell->yuvFormat) ||
+            (imageMetadata->yuvRange != firstCell->yuvRange) || (imageMetadata->colorPrimaries != firstCell->colorPrimaries) ||
+            (imageMetadata->transferCharacteristics != firstCell->transferCharacteristics) ||
+            (imageMetadata->matrixCoefficients != firstCell->matrixCoefficients) ||
+            (imageMetadata->alphaPremultiplied != firstCell->alphaPremultiplied) ||
+            (encoder->data->alphaPresent && !firstCell->alphaPlane)) {
+            return AVIF_RESULT_INCOMPATIBLE_IMAGE;
+        }
+    }
+
+    if (encoder->data->frames.count == 1) {
+        // We will be writing an image sequence. When writing the AV1SampleEntry (derived from
+        // VisualSampleEntry) in the stsd box, we need to cast imageMetadata->width and
+        // imageMetadata->height to uint16_t:
+        //     class VisualSampleEntry(codingname) extends SampleEntry (codingname){
+        //        ...
+        //        unsigned int(16) width;
+        //        unsigned int(16) height;
+        //        ...
+        //     }
+        // Check whether it is safe to cast width and height to uint16_t. The maximum width and
+        // height of an AV1 frame are 65536, which just exceeds uint16_t.
+        assert(encoder->data->items.count > 0);
+        const avifImage * imageMetadata = encoder->data->imageMetadata;
+        if ((imageMetadata->width > 65535) || (imageMetadata->height > 65535)) {
+            return AVIF_RESULT_INVALID_ARGUMENT;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Encode AV1 OBUs
+
+    if (encoder->keyframeInterval && ((encoder->data->frames.count % encoder->keyframeInterval) == 0)) {
+        addImageFlags |= AVIF_ADD_IMAGE_FLAG_FORCE_KEYFRAME;
+    }
+
+    const int faceQuality = encoder->quality;
+    const int faceSpeed = encoder->speed;
+    for (uint32_t itemIndex = 0; itemIndex < encoder->data->items.count; ++itemIndex) {
+        if (contains(faceIdCells, sizeFaceIdCells, itemIndex))
+        {
+            encoder->quality = faceQuality;
+            encoder->speed = faceSpeed;
+        }
+
+        encoder->quality = 0;
+        encoder->speed = 0;
+
+        avifEncoderItem * item = &encoder->data->items.item[itemIndex];
+        if (item->codec) {
+            const avifImage * cellImage = cellImages[item->cellIndex];
+            avifImage * paddedCellImage = NULL;
+            if ((cellImage->width != tileWidth) || (cellImage->height != tileHeight)) {
+                paddedCellImage = avifImageCopyAndPad(cellImage, tileWidth, tileHeight);
+                if (!paddedCellImage) {
+                    return AVIF_RESULT_OUT_OF_MEMORY;
+                }
+                cellImage = paddedCellImage;
+            }
+            const int quantizer = item->alpha ? encoder->data->quantizerAlpha : encoder->data->quantizer;
+            avifResult encodeResult = item->codec->encodeImage(item->codec,
+                                                               encoder,
+                                                               cellImage,
+                                                               item->alpha,
+                                                               encoder->data->tileRowsLog2,
+                                                               encoder->data->tileColsLog2,
+                                                               quantizer,
+                                                               encoderChanges,
+                                                               addImageFlags,
+                                                               item->encodeOutput);
+            if (paddedCellImage) {
+                avifImageDestroy(paddedCellImage);
+            }
+            if (encodeResult == AVIF_RESULT_UNKNOWN_ERROR) {
+                encodeResult = item->alpha ? AVIF_RESULT_ENCODE_ALPHA_FAILED : AVIF_RESULT_ENCODE_COLOR_FAILED;
+            }
+            if (encodeResult != AVIF_RESULT_OK) {
+                return encodeResult;
+            }
+        }
+    }
+
+    avifCodecSpecificOptionsClear(encoder->csOptions);
+    avifEncoderFrame * frame = (avifEncoderFrame *)avifArrayPushPtr(&encoder->data->frames);
+    frame->durationInTimescales = durationInTimescales;
+    return AVIF_RESULT_OK;
+}
+
+//-----------------------------------------------------------------
 
 static size_t avifEncoderFindExistingChunk(avifRWStream * s, size_t mdatStartOffset, const uint8_t * data, size_t size)
 {
