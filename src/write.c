@@ -1227,21 +1227,6 @@ avifResult avifEncoderAddImageGrid(avifEncoder * encoder,
 // Modification.
 // -----------------------------------------------------------------
 
-avifResult avifEncoderAddFaceImageGrid(avifEncoder * encoder,
-                                            uint32_t gridCols,
-                                            uint32_t gridRows,
-                                            const int * faceIdCells,
-                                            const int sizeFaceIdCells,
-                                            const avifImage * const * cellImages,
-                                            avifAddImageFlags addImageFlags) 
-{
-    avifDiagnosticsClearError(&encoder->diag);
-    if ((gridCols == 0) || (gridCols > 256) || (gridRows == 0) || (gridRows > 256)) {
-        return AVIF_RESULT_INVALID_IMAGE_GRID;
-    }
-    return avifEncoderAddFaceImageInternal(encoder, gridCols, gridRows, faceIdCells, sizeFaceIdCells, cellImages, 1, addImageFlags | AVIF_ADD_IMAGE_FLAG_SINGLE); // image grids cannot be image sequences
-
-}
 
 static avifResult avifEncoderAddFaceImageInternal(avifEncoder * encoder,
                                               uint32_t gridCols,
@@ -1599,6 +1584,21 @@ static avifResult avifEncoderAddFaceImageInternal(avifEncoder * encoder,
     return AVIF_RESULT_OK;
 }
 
+avifResult avifEncoderAddFaceImageGrid(avifEncoder * encoder,
+                                            uint32_t gridCols,
+                                            uint32_t gridRows,
+                                            const int * faceIdCells,
+                                            const int sizeFaceIdCells,
+                                            const avifImage * const * cellImages,
+                                            avifAddImageFlags addImageFlags) 
+{
+    avifDiagnosticsClearError(&encoder->diag);
+    if ((gridCols == 0) || (gridCols > 256) || (gridRows == 0) || (gridRows > 256)) {
+        return AVIF_RESULT_INVALID_IMAGE_GRID;
+    }
+    return avifEncoderAddFaceImageInternal(encoder, gridCols, gridRows, faceIdCells, sizeFaceIdCells, cellImages, 1, addImageFlags | AVIF_ADD_IMAGE_FLAG_SINGLE); // image grids cannot be image sequences
+
+}
 //-----------------------------------------------------------------
 
 static size_t avifEncoderFindExistingChunk(avifRWStream * s, size_t mdatStartOffset, const uint8_t * data, size_t size)
